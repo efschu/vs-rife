@@ -5,8 +5,10 @@ import os
 import sys
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from fractions import Fraction
 from threading import Lock
+from typing import Callable
 
 import numpy as np
 import torch
@@ -76,11 +78,34 @@ def redirect_stdout_to_stderr():
         os.close(old_stdout)
 
 
+@dataclass
+class GPUWorker:
+    """Per-GPU state: model, streams, locks, constants, caches."""
+    device: torch.device
+    flownet: nn.Module | Callable
+    encode: nn.Module | Callable | None
+    dtype: torch.dtype
+    inf_stream: torch.cuda.Stream
+    inf_f2t_stream: torch.cuda.Stream
+    inf_t2f_stream: torch.cuda.Stream
+    inf_stream_lock: Lock
+    inf_f2t_stream_lock: Lock
+    inf_t2f_stream_lock: Lock
+    enc_stream: torch.cuda.Stream | None = None
+    enc_f2t_stream: torch.cuda.Stream | None = None
+    enc_stream_lock: Lock | None = None
+    enc_f2t_stream_lock: Lock | None = None
+    tenFlow_div: torch.Tensor | None = None
+    backwarp_tenGrid: torch.Tensor | None = None
+    frame_cache: dict[int, torch.Tensor] = field(default_factory=dict)
+    encode_cache: dict[int, torch.Tensor] = field(default_factory=dict)
+
+
 @redirect_stdout_to_stderr()
 @torch.inference_mode()
 def rife(
     clip: vs.VideoNode,
-    device_index: int = 0,
+    device_index: int | list[int] = 0,
     model: str = "4.25",
     auto_download: bool = False,
     factor_num: int = 2,
@@ -104,39 +129,41 @@ def rife(
     """Real-Time Intermediate Flow Estimation for Video Frame Interpolation
 
     :param clip:                    Clip to process. Only RGBH and RGBS formats are supported.
-                                    RGBH performs inference in FP16 mode while RGBS performs inference in FP32 mode.
-    :param device_index:            Device ordinal of the GPU.
+                                     RGBH performs inference in FP16 mode while RGBS performs inference in FP32 mode.
+    :param device_index:            Device ordinal(s) of the GPU(s). Pass a single int for one GPU,
+                                     or a list of ints for multi-GPU round-robin distribution.
+                                     With multiple GPUs, frame N is processed on GPU (N % num_gpus).
     :param model:                   Model to use.
     :param auto_download:           Automatically download the specified model if the file has not been downloaded.
     :param factor_num:              Numerator of factor for target frame rate.
     :param factor_den:              Denominator of factor for target frame rate.
-                                    For example `factor_num=5, factor_den=2` will multiply the frame rate by 2.5.
+                                     For example `factor_num=5, factor_den=2` will multiply the frame rate by 2.5.
     :param fps_num:                 Numerator of target frame rate.
     :param fps_den:                 Denominator of target frame rate.
-                                    Override `factor_num` and `factor_den` if specified.
+                                     Override `factor_num` and `factor_den` if specified.
     :param scale:                   Control the process resolution for optical flow model. Try scale=0.5 for 4K video.
-                                    Must be 0.25, 0.5, 1.0, 2.0, or 4.0.
+                                     Must be 0.25, 0.5, 1.0, 2.0, or 4.0.
     :param ensemble:                Smooth predictions in areas where the estimation is uncertain.
     :param sc:                      Avoid interpolating frames over scene changes.
     :param sc_threshold:            Threshold for scene change detection. Must be between 0.0 and 1.0.
-                                    Leave the argument as None if the frames already have _SceneChangeNext property set.
+                                     Leave the argument as None if the frames already have _SceneChangeNext property set.
     :param trt:                     Use TensorRT for high-performance inference.
-                                    Not supported in '4.0' and '4.1' models.
+                                     Not supported in '4.0' and '4.1' models.
     :param trt_static_shape:        Build with static or dynamic shapes.
     :param trt_min_shape:           Min size of dynamic shapes. Ignored if trt_static_shape=True.
     :param trt_opt_shape:           Opt size of dynamic shapes. Ignored if trt_static_shape=True.
     :param trt_max_shape:           Max size of dynamic shapes. Ignored if trt_static_shape=True.
     :param trt_workspace_size:      Size constraints of workspace memory pool.
     :param trt_max_aux_streams:     Maximum number of auxiliary streams per inference stream that TRT is allowed to use
-                                    to run kernels in parallel if the network contains ops that can run in parallel,
-                                    with the cost of more memory usage. Set this to 0 for optimal memory usage.
-                                    (default = using heuristics)
+                                     to run kernels in parallel if the network contains ops that can run in parallel,
+                                     with the cost of more memory usage. Set this to 0 for optimal memory usage.
+                                     (default = using heuristics)
     :param trt_optimization_level:  Builder optimization level. Higher level allows TensorRT to spend more building time
-                                    for more optimization options. Valid values include integers from 0 to the maximum
-                                    optimization level, which is currently 5. (default is 3)
+                                     for more optimization options. Valid values include integers from 0 to the maximum
+                                     optimization level, which is currently 5. (default is 3)
     :param trt_cache_dir:           Directory for TensorRT engine file. Engine will be cached when it's built for the
-                                    first time. Note each engine is created for specific settings such as model
-                                    path/name, precision, workspace etc, and specific GPUs and it's not portable.
+                                     first time. Note each engine is created for specific settings such as model
+                                     path/name, precision, workspace etc, and specific GPUs and it's not portable.
     """
     if not isinstance(clip, vs.VideoNode):
         raise vs.Error("rife: this is not a clip")
@@ -207,7 +234,18 @@ def rife(
     fp16 = clip.format.bits_per_sample == 16
     dtype = torch.half if fp16 else torch.float
 
-    device = torch.device("cuda", device_index)
+    if isinstance(device_index, int):
+        devices = [torch.device("cuda", device_index)]
+    elif isinstance(device_index, list):
+        if len(device_index) < 1:
+            raise vs.Error("rife: device_index list must contain at least one device")
+        devices = [torch.device("cuda", idx) for idx in device_index]
+    else:
+        raise vs.Error("rife: device_index must be an int or a list of ints")
+
+    for i, d in enumerate(devices):
+        if d.index is None or d.index >= torch.cuda.device_count():
+            raise vs.Error(f"rife: GPU {d.index} is not available (found {torch.cuda.device_count()} GPUs)")
 
     modulo = 32
 
@@ -441,147 +479,139 @@ def rife(
     if sc and sc_threshold is not None:
         clip = sc_detect(clip, sc_threshold)
 
-    if trt:
-        import tensorrt
-        import torch_tensorrt
+    workers: list[GPUWorker] = []
 
-        if trt_static_shape:
-            dimensions = f"{pw}x{ph}"
-        else:
-            for i in range(2):
-                trt_min_shape[i] = math.ceil(trt_min_shape[i] / tmp) * tmp
-                trt_opt_shape[i] = math.ceil(trt_opt_shape[i] / tmp) * tmp
-                trt_max_shape[i] = math.ceil(trt_max_shape[i] / tmp) * tmp
-
-            dimensions = (
-                f"min-{trt_min_shape[0]}x{trt_min_shape[1]}"
-                f"_opt-{trt_opt_shape[0]}x{trt_opt_shape[1]}"
-                f"_max-{trt_max_shape[0]}x{trt_max_shape[1]}"
-            )
-
-        flownet_engine_path = os.path.join(
-            os.path.realpath(trt_cache_dir),
-            (
-                f"{model_name}"
-                + f"_{dimensions}"
-                + f"_{'fp16' if fp16 else 'fp32'}"
-                + f"_scale-{scale}"
-                + f"_ensemble-{ensemble}"
-                + f"_{torch.cuda.get_device_name(device)}"
-                + f"_trt-{tensorrt.__version__}"
-                + (f"_workspace-{trt_workspace_size}" if trt_workspace_size > 0 else "")
-                + (f"_aux-{trt_max_aux_streams}" if trt_max_aux_streams is not None else "")
-                + (f"_level-{trt_optimization_level}" if trt_optimization_level is not None else "")
-                + ".ts"
-            ),
-        )
-
-        encode_engine_path = flownet_engine_path + ".encode"
-
-        if not os.path.isfile(flownet_engine_path) or (Head is not None and not os.path.isfile(encode_engine_path)):
-            if sys.stdout is None:
-                sys.stdout = open(os.devnull, "w")
-
-            flownet, encode = init_module(model_name, IFNet, scale, ensemble, device, dtype, Head)
+    for dev_idx, device in enumerate(devices):
+        if trt:
+            import tensorrt
+            import torch_tensorrt
 
             if trt_static_shape:
-                if encode is not None:
-                    flownet_inputs = (
-                        torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([1, 1, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([2], dtype=torch.float, device=device),
-                        torch.zeros([1, 2, ph, pw], dtype=torch.float, device=device),
-                        torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=device),
-                    )
-
-                    encode_inputs = (torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),)
-                else:
-                    flownet_inputs = (
-                        torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([1, 1, ph, pw], dtype=dtype, device=device),
-                        torch.zeros([2], dtype=torch.float, device=device),
-                        torch.zeros([1, 2, ph, pw], dtype=torch.float, device=device),
-                    )
-
-                flownet_dynamic_shapes = None
-                encode_dynamic_shapes = None
+                dimensions = f"{pw}x{ph}"
             else:
-                trt_min_shape.reverse()
-                trt_opt_shape.reverse()
-                trt_max_shape.reverse()
+                trt_min_s = list(trt_min_shape)
+                trt_opt_s = list(trt_opt_shape)
+                trt_max_s = list(trt_max_shape)
+                for i in range(2):
+                    trt_min_s[i] = math.ceil(trt_min_s[i] / tmp) * tmp
+                    trt_opt_s[i] = math.ceil(trt_opt_s[i] / tmp) * tmp
+                    trt_max_s[i] = math.ceil(trt_max_s[i] / tmp) * tmp
 
-                if encode is not None:
-                    flownet_inputs = (
-                        torch.zeros([1, 3] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([1, 3] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([1, 1] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([2], dtype=torch.float, device=device),
-                        torch.zeros([1, 2] + trt_opt_shape, dtype=torch.float, device=device),
-                        torch.zeros([1, encode_channel] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([1, encode_channel] + trt_opt_shape, dtype=dtype, device=device),
-                    )
+                dimensions = (
+                    f"min-{trt_min_s[0]}x{trt_min_s[1]}"
+                    f"_opt-{trt_opt_s[0]}x{trt_opt_s[1]}"
+                    f"_max-{trt_max_s[0]}x{trt_max_s[1]}"
+                )
 
-                    encode_inputs = (torch.zeros([1, 3] + trt_opt_shape, dtype=dtype, device=device),)
-                else:
-                    flownet_inputs = (
-                        torch.zeros([1, 3] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([1, 3] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([1, 1] + trt_opt_shape, dtype=dtype, device=device),
-                        torch.zeros([2], dtype=torch.float, device=device),
-                        torch.zeros([1, 2] + trt_opt_shape, dtype=torch.float, device=device),
-                    )
+            gpu_suffix = f"_gpu{dev_idx}" if len(devices) > 1 else ""
 
-                _height = torch.export.Dim("height", min=trt_min_shape[0] // tmp, max=trt_max_shape[0] // tmp)
-                _width = torch.export.Dim("width", min=trt_min_shape[1] // tmp, max=trt_max_shape[1] // tmp)
-                dim_height = _height * tmp
-                dim_width = _width * tmp
-
-                if encode is not None:
-                    flownet_dynamic_shapes = {
-                        "img0": {2: dim_height, 3: dim_width},
-                        "img1": {2: dim_height, 3: dim_width},
-                        "timestep": {2: dim_height, 3: dim_width},
-                        "tenFlow_div": {},
-                        "backwarp_tenGrid": {2: dim_height, 3: dim_width},
-                        "f0": {2: dim_height, 3: dim_width},
-                        "f1": {2: dim_height, 3: dim_width},
-                    }
-
-                    encode_dynamic_shapes = ({2: dim_height, 3: dim_width},)
-                else:
-                    flownet_dynamic_shapes = {
-                        "img0": {2: dim_height, 3: dim_width},
-                        "img1": {2: dim_height, 3: dim_width},
-                        "timestep": {2: dim_height, 3: dim_width},
-                        "tenFlow_div": {},
-                        "backwarp_tenGrid": {2: dim_height, 3: dim_width},
-                    }
-
-            flownet_program = torch.export.export(flownet, flownet_inputs, dynamic_shapes=flownet_dynamic_shapes)
-
-            flownet = torch_tensorrt.dynamo.compile(
-                flownet_program,
-                flownet_inputs,
-                device=device,
-                num_avg_timing_iters=4,
-                workspace_size=trt_workspace_size,
-                min_block_size=1,
-                max_aux_streams=trt_max_aux_streams,
-                optimization_level=trt_optimization_level,
-                use_explicit_typing=True,
+            flownet_engine_path = os.path.join(
+                os.path.realpath(trt_cache_dir),
+                (
+                    f"{model_name}"
+                    + f"_{dimensions}"
+                    + f"_{'fp16' if fp16 else 'fp32'}"
+                    + f"_scale-{scale}"
+                    + f"_ensemble-{ensemble}"
+                    + gpu_suffix
+                    + f"_{torch.cuda.get_device_name(device)}"
+                    + f"_trt-{tensorrt.__version__}"
+                    + (f"_workspace-{trt_workspace_size}" if trt_workspace_size > 0 else "")
+                    + (f"_aux-{trt_max_aux_streams}" if trt_max_aux_streams is not None else "")
+                    + (f"_level-{trt_optimization_level}" if trt_optimization_level is not None else "")
+                    + ".ts"
+                ),
             )
 
-            torch_tensorrt.save(flownet, flownet_engine_path, output_format="torchscript", inputs=flownet_inputs)
+            encode_engine_path = flownet_engine_path + ".encode"
 
-            if encode is not None:
-                encode_program = torch.export.export(encode, encode_inputs, dynamic_shapes=encode_dynamic_shapes)
+            if not os.path.isfile(flownet_engine_path) or (Head is not None and not os.path.isfile(encode_engine_path)):
+                if sys.stdout is None:
+                    sys.stdout = open(os.devnull, "w")
 
-                encode = torch_tensorrt.dynamo.compile(
-                    encode_program,
-                    encode_inputs,
+                flownet, encode = init_module(model_name, IFNet, scale, ensemble, device, dtype, Head)
+
+                if trt_static_shape:
+                    if encode is not None:
+                        flownet_inputs = (
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([1, 1, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([2], dtype=torch.float, device=device),
+                            torch.zeros([1, 2, ph, pw], dtype=torch.float, device=device),
+                            torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=device),
+                        )
+
+                        encode_inputs = (torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),)
+                    else:
+                        flownet_inputs = (
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([1, 1, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([2], dtype=torch.float, device=device),
+                            torch.zeros([1, 2, ph, pw], dtype=torch.float, device=device),
+                        )
+
+                    flownet_dynamic_shapes = None
+                    encode_dynamic_shapes = None
+                else:
+                    trt_min_s.reverse()
+                    trt_opt_s.reverse()
+                    trt_max_s.reverse()
+
+                    if encode is not None:
+                        flownet_inputs = (
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([1, 1] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([2], dtype=torch.float, device=device),
+                            torch.zeros([1, 2] + trt_opt_s, dtype=torch.float, device=device),
+                            torch.zeros([1, encode_channel] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([1, encode_channel] + trt_opt_s, dtype=dtype, device=device),
+                        )
+
+                        encode_inputs = (torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),)
+                    else:
+                        flownet_inputs = (
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([1, 1] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([2], dtype=torch.float, device=device),
+                            torch.zeros([1, 2] + trt_opt_s, dtype=torch.float, device=device),
+                        )
+
+                    _height = torch.export.Dim("height", min=trt_min_s[0] // tmp, max=trt_max_s[0] // tmp)
+                    _width = torch.export.Dim("width", min=trt_min_s[1] // tmp, max=trt_max_s[1] // tmp)
+                    dim_height = _height * tmp
+                    dim_width = _width * tmp
+
+                    if encode is not None:
+                        flownet_dynamic_shapes = {
+                            "img0": {2: dim_height, 3: dim_width},
+                            "img1": {2: dim_height, 3: dim_width},
+                            "timestep": {2: dim_height, 3: dim_width},
+                            "tenFlow_div": {},
+                            "backwarp_tenGrid": {2: dim_height, 3: dim_width},
+                            "f0": {2: dim_height, 3: dim_width},
+                            "f1": {2: dim_height, 3: dim_width},
+                        }
+
+                        encode_dynamic_shapes = ({2: dim_height, 3: dim_width},)
+                    else:
+                        flownet_dynamic_shapes = {
+                            "img0": {2: dim_height, 3: dim_width},
+                            "img1": {2: dim_height, 3: dim_width},
+                            "timestep": {2: dim_height, 3: dim_width},
+                            "tenFlow_div": {},
+                            "backwarp_tenGrid": {2: dim_height, 3: dim_width},
+                        }
+
+                flownet_program = torch.export.export(flownet, flownet_inputs, dynamic_shapes=flownet_dynamic_shapes)
+
+                flownet = torch_tensorrt.dynamo.compile(
+                    flownet_program,
+                    flownet_inputs,
                     device=device,
                     num_avg_timing_iters=4,
                     workspace_size=trt_workspace_size,
@@ -591,132 +621,175 @@ def rife(
                     use_explicit_typing=True,
                 )
 
-                torch_tensorrt.save(encode, encode_engine_path, output_format="torchscript", inputs=encode_inputs)
+                torch_tensorrt.save(flownet, flownet_engine_path, output_format="torchscript", inputs=flownet_inputs)
 
-        flownet = torch.jit.load(flownet_engine_path).eval()
+                if encode is not None:
+                    encode_program = torch.export.export(encode, encode_inputs, dynamic_shapes=encode_dynamic_shapes)
+
+                    encode = torch_tensorrt.dynamo.compile(
+                        encode_program,
+                        encode_inputs,
+                        device=device,
+                        num_avg_timing_iters=4,
+                        workspace_size=trt_workspace_size,
+                        min_block_size=1,
+                        max_aux_streams=trt_max_aux_streams,
+                        optimization_level=trt_optimization_level,
+                        use_explicit_typing=True,
+                    )
+
+                    torch_tensorrt.save(encode, encode_engine_path, output_format="torchscript", inputs=encode_inputs)
+
+            flownet = torch.jit.load(flownet_engine_path).eval()
+            if Head is not None:
+                encode = torch.jit.load(encode_engine_path).eval()
+        else:
+            flownet, encode = init_module(model_name, IFNet, scale, ensemble, device, dtype, Head)
+
+        inf_stream = torch.cuda.Stream(device)
+        inf_f2t_stream = torch.cuda.Stream(device)
+        inf_t2f_stream = torch.cuda.Stream(device)
+
+        inf_stream_lock = Lock()
+        inf_f2t_stream_lock = Lock()
+        inf_t2f_stream_lock = Lock()
+
+        enc_stream = None
+        enc_f2t_stream = None
+        enc_stream_lock = None
+        enc_f2t_stream_lock = None
+
         if Head is not None:
-            encode = torch.jit.load(encode_engine_path).eval()
-    else:
-        flownet, encode = init_module(model_name, IFNet, scale, ensemble, device, dtype, Head)
+            enc_stream = torch.cuda.Stream(device)
+            enc_f2t_stream = torch.cuda.Stream(device)
+            enc_stream_lock = Lock()
+            enc_f2t_stream_lock = Lock()
 
-    inf_stream = torch.cuda.Stream(device)
-    inf_f2t_stream = torch.cuda.Stream(device)
-    inf_t2f_stream = torch.cuda.Stream(device)
+        tenFlow_div = torch.tensor([(pw - 1.0) / 2.0, (ph - 1.0) / 2.0], dtype=torch.float, device=device)
 
-    inf_stream_lock = Lock()
-    inf_f2t_stream_lock = Lock()
-    inf_t2f_stream_lock = Lock()
+        tenHorizontal = torch.linspace(-1.0, 1.0, pw, dtype=torch.float, device=device)
+        tenHorizontal = tenHorizontal.view(1, 1, 1, pw).expand(-1, -1, ph, -1)
+        tenVertical = torch.linspace(-1.0, 1.0, ph, dtype=torch.float, device=device)
+        tenVertical = tenVertical.view(1, 1, ph, 1).expand(-1, -1, -1, pw)
+        backwarp_tenGrid = torch.cat([tenHorizontal, tenVertical], 1)
 
-    if Head is not None:
-        enc_stream = torch.cuda.Stream(device)
-        enc_f2t_stream = torch.cuda.Stream(device)
+        workers.append(GPUWorker(
+            device=device,
+            flownet=flownet,
+            encode=encode,
+            dtype=dtype,
+            inf_stream=inf_stream,
+            inf_f2t_stream=inf_f2t_stream,
+            inf_t2f_stream=inf_t2f_stream,
+            inf_stream_lock=inf_stream_lock,
+            inf_f2t_stream_lock=inf_f2t_stream_lock,
+            inf_t2f_stream_lock=inf_t2f_stream_lock,
+            enc_stream=enc_stream,
+            enc_f2t_stream=enc_f2t_stream,
+            enc_stream_lock=enc_stream_lock,
+            enc_f2t_stream_lock=enc_f2t_stream_lock,
+            tenFlow_div=tenFlow_div,
+            backwarp_tenGrid=backwarp_tenGrid,
+        ))
 
-        enc_stream_lock = Lock()
-        enc_f2t_stream_lock = Lock()
+    for w in workers:
+        torch.cuda.current_stream(w.device).synchronize()
 
-    tenFlow_div = torch.tensor([(pw - 1.0) / 2.0, (ph - 1.0) / 2.0], dtype=torch.float, device=device)
-
-    tenHorizontal = torch.linspace(-1.0, 1.0, pw, dtype=torch.float, device=device)
-    tenHorizontal = tenHorizontal.view(1, 1, 1, pw).expand(-1, -1, ph, -1)
-    tenVertical = torch.linspace(-1.0, 1.0, ph, dtype=torch.float, device=device)
-    tenVertical = tenVertical.view(1, 1, ph, 1).expand(-1, -1, -1, pw)
-    backwarp_tenGrid = torch.cat([tenHorizontal, tenVertical], 1)
-
-    torch.cuda.current_stream(device).synchronize()
-
-    frame_cache = {}
-    encode_cache = {}
+    num_workers = len(workers)
 
     @torch.inference_mode()
     def encoding(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
-        with enc_f2t_stream_lock, torch.cuda.stream(enc_f2t_stream):
-            img = frame_to_tensor(f, device)
+        for worker in workers:
+            with worker.enc_f2t_stream_lock, torch.cuda.stream(worker.enc_f2t_stream):
+                img = frame_to_tensor(f, worker.device)
 
-            if need_pad:
-                img = F.pad(img, padding)
+                if need_pad:
+                    img = F.pad(img, padding)
 
-            enc_f2t_stream.synchronize()
+                worker.enc_f2t_stream.synchronize()
 
-            frame_cache[n] = img
+                worker.frame_cache[n] = img
 
-        with enc_stream_lock, torch.cuda.stream(enc_stream):
-            output = encode(img)
+            with worker.enc_stream_lock, torch.cuda.stream(worker.enc_stream):
+                output = worker.encode(img)
 
-            enc_stream.synchronize()
+                worker.enc_stream.synchronize()
 
-            encode_cache[n] = output
+                worker.encode_cache[n] = output
 
-            return f
+        return f
 
     @torch.inference_mode()
     def inference(n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
-        with inf_f2t_stream_lock, torch.cuda.stream(inf_f2t_stream):
-            if Head is not None:
+        worker = workers[n % num_workers]
+
+        with worker.inf_f2t_stream_lock, torch.cuda.stream(worker.inf_f2t_stream):
+            if worker.encode is not None:
                 real_n = n * factor_den // factor_num
                 real_n_next = min(real_n + 1, clip.num_frames - 1)
 
                 cache_to_delete = real_n - 10
 
                 if cache_to_delete >= 0:
-                    if cache_to_delete in frame_cache:
-                        del frame_cache[cache_to_delete]
+                    if cache_to_delete in worker.frame_cache:
+                        del worker.frame_cache[cache_to_delete]
 
-                    if cache_to_delete in encode_cache:
-                        del encode_cache[cache_to_delete]
+                    if cache_to_delete in worker.encode_cache:
+                        del worker.encode_cache[cache_to_delete]
 
             t = n * factor_den % factor_num / factor_num
 
             if t == 0 or (sc and f[0].props.get("_SceneChangeNext")):
                 return f[0]
 
-            if Head is not None:
-                if real_n in frame_cache:
-                    img0 = frame_cache[real_n]
+            if worker.encode is not None:
+                if real_n in worker.frame_cache:
+                    img0 = worker.frame_cache[real_n]
                 else:
-                    img0 = frame_to_tensor(f[0], device)
+                    img0 = frame_to_tensor(f[0], worker.device)
                     if need_pad:
                         img0 = F.pad(img0, padding)
 
-                if real_n_next in frame_cache:
-                    img1 = frame_cache[real_n_next]
+                if real_n_next in worker.frame_cache:
+                    img1 = worker.frame_cache[real_n_next]
                 else:
-                    img1 = frame_to_tensor(f[1], device)
+                    img1 = frame_to_tensor(f[1], worker.device)
                     if need_pad:
                         img1 = F.pad(img1, padding)
 
-                if real_n in encode_cache:
-                    f0 = encode_cache[real_n]
+                if real_n in worker.encode_cache:
+                    f0 = worker.encode_cache[real_n]
                 else:
-                    f0 = encode(img0)
+                    f0 = worker.encode(img0)
 
-                if real_n_next in encode_cache:
-                    f1 = encode_cache[real_n_next]
+                if real_n_next in worker.encode_cache:
+                    f1 = worker.encode_cache[real_n_next]
                 else:
-                    f1 = encode(img1)
+                    f1 = worker.encode(img1)
             else:
-                img0 = frame_to_tensor(f[0], device)
-                img1 = frame_to_tensor(f[1], device)
+                img0 = frame_to_tensor(f[0], worker.device)
+                img1 = frame_to_tensor(f[1], worker.device)
                 if need_pad:
                     img0 = F.pad(img0, padding)
                     img1 = F.pad(img1, padding)
 
-            timestep = torch.full([1, 1, ph, pw], t, dtype=dtype, device=device)
+            timestep = torch.full([1, 1, ph, pw], t, dtype=worker.dtype, device=worker.device)
 
-            inf_f2t_stream.synchronize()
+            worker.inf_f2t_stream.synchronize()
 
-        with inf_stream_lock, torch.cuda.stream(inf_stream):
-            if Head is not None:
-                output = flownet(img0, img1, timestep, tenFlow_div, backwarp_tenGrid, f0, f1)
+        with worker.inf_stream_lock, torch.cuda.stream(worker.inf_stream):
+            if worker.encode is not None:
+                output = worker.flownet(img0, img1, timestep, worker.tenFlow_div, worker.backwarp_tenGrid, f0, f1)
             else:
-                output = flownet(img0, img1, timestep, tenFlow_div, backwarp_tenGrid)
+                output = worker.flownet(img0, img1, timestep, worker.tenFlow_div, worker.backwarp_tenGrid)
 
-            inf_stream.synchronize()
+            worker.inf_stream.synchronize()
 
-        with inf_t2f_stream_lock, torch.cuda.stream(inf_t2f_stream):
+        with worker.inf_t2f_stream_lock, torch.cuda.stream(worker.inf_t2f_stream):
             if need_pad:
                 output = output[:, :, :h, :w]
 
-            return tensor_to_frame(output, f[0].copy(), inf_t2f_stream)
+            return tensor_to_frame(output, f[0].copy(), worker.inf_t2f_stream)
 
     if Head is not None:
         encoded = clip.std.FrameEval(lambda n: clip.std.ModifyFrame(clip, encoding), clip_src=clip)
