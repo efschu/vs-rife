@@ -503,7 +503,11 @@ def rife(
                     f"_max-{trt_max_s[0]}x{trt_max_s[1]}"
                 )
 
-            gpu_suffix = f"_gpu{dev_idx}" if len(devices) > 1 else ""
+            # Use first GPU to build engine (identical GPUs share engines)
+            build_device = devices[0]
+            build_dev_idx = 0
+
+            gpu_suffix = f"_gpu{build_dev_idx}" if len(devices) > 1 else ""
 
             flownet_engine_path = os.path.join(
                 os.path.realpath(trt_cache_dir),
@@ -514,7 +518,7 @@ def rife(
                     + f"_scale-{scale}"
                     + f"_ensemble-{ensemble}"
                     + gpu_suffix
-                    + f"_{torch.cuda.get_device_name(device)}"
+                    + f"_{torch.cuda.get_device_name(build_device)}"
                     + f"_trt-{tensorrt.__version__}"
                     + (f"_workspace-{trt_workspace_size}" if trt_workspace_size > 0 else "")
                     + (f"_aux-{trt_max_aux_streams}" if trt_max_aux_streams is not None else "")
@@ -529,28 +533,28 @@ def rife(
                 if sys.stdout is None:
                     sys.stdout = open(os.devnull, "w")
 
-                flownet, encode = init_module(model_name, IFNet, scale, ensemble, device, dtype, Head)
+                flownet, encode = init_module(model_name, IFNet, scale, ensemble, build_device, dtype, Head)
 
                 if trt_static_shape:
                     if encode is not None:
                         flownet_inputs = (
-                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([1, 1, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([2], dtype=torch.float, device=device),
-                            torch.zeros([1, 2, ph, pw], dtype=torch.float, device=device),
-                            torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=device),
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([1, 1, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([2], dtype=torch.float, device=build_device),
+                            torch.zeros([1, 2, ph, pw], dtype=torch.float, device=build_device),
+                            torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([1, encode_channel, ph, pw], dtype=dtype, device=build_device),
                         )
 
-                        encode_inputs = (torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),)
+                        encode_inputs = (torch.zeros([1, 3, ph, pw], dtype=dtype, device=build_device),)
                     else:
                         flownet_inputs = (
-                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([1, 1, ph, pw], dtype=dtype, device=device),
-                            torch.zeros([2], dtype=torch.float, device=device),
-                            torch.zeros([1, 2, ph, pw], dtype=torch.float, device=device),
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([1, 3, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([1, 1, ph, pw], dtype=dtype, device=build_device),
+                            torch.zeros([2], dtype=torch.float, device=build_device),
+                            torch.zeros([1, 2, ph, pw], dtype=torch.float, device=build_device),
                         )
 
                     flownet_dynamic_shapes = None
@@ -562,23 +566,23 @@ def rife(
 
                     if encode is not None:
                         flownet_inputs = (
-                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([1, 1] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([2], dtype=torch.float, device=device),
-                            torch.zeros([1, 2] + trt_opt_s, dtype=torch.float, device=device),
-                            torch.zeros([1, encode_channel] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([1, encode_channel] + trt_opt_s, dtype=dtype, device=device),
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([1, 1] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([2], dtype=torch.float, device=build_device),
+                            torch.zeros([1, 2] + trt_opt_s, dtype=torch.float, device=build_device),
+                            torch.zeros([1, encode_channel] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([1, encode_channel] + trt_opt_s, dtype=dtype, device=build_device),
                         )
 
-                        encode_inputs = (torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),)
+                        encode_inputs = (torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=build_device),)
                     else:
                         flownet_inputs = (
-                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([1, 1] + trt_opt_s, dtype=dtype, device=device),
-                            torch.zeros([2], dtype=torch.float, device=device),
-                            torch.zeros([1, 2] + trt_opt_s, dtype=torch.float, device=device),
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([1, 3] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([1, 1] + trt_opt_s, dtype=dtype, device=build_device),
+                            torch.zeros([2], dtype=torch.float, device=build_device),
+                            torch.zeros([1, 2] + trt_opt_s, dtype=torch.float, device=build_device),
                         )
 
                     _height = torch.export.Dim("height", min=trt_min_s[0] // tmp, max=trt_max_s[0] // tmp)
@@ -612,7 +616,7 @@ def rife(
                 flownet = torch_tensorrt.dynamo.compile(
                     flownet_program,
                     flownet_inputs,
-                    device=device,
+                    device=build_device,
                     num_avg_timing_iters=4,
                     workspace_size=trt_workspace_size,
                     min_block_size=1,
@@ -629,7 +633,7 @@ def rife(
                     encode = torch_tensorrt.dynamo.compile(
                         encode_program,
                         encode_inputs,
-                        device=device,
+                        device=build_device,
                         num_avg_timing_iters=4,
                         workspace_size=trt_workspace_size,
                         min_block_size=1,
@@ -640,9 +644,9 @@ def rife(
 
                     torch_tensorrt.save(encode, encode_engine_path, output_format="torchscript", inputs=encode_inputs)
 
-            flownet = torch.jit.load(flownet_engine_path).eval()
+            flownet = torch.jit.load(flownet_engine_path, map_location=device).eval()
             if Head is not None:
-                encode = torch.jit.load(encode_engine_path).eval()
+                encode = torch.jit.load(encode_engine_path, map_location=device).eval()
         else:
             flownet, encode = init_module(model_name, IFNet, scale, ensemble, device, dtype, Head)
 
